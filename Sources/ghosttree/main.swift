@@ -30,17 +30,30 @@ struct GhosttreeCLI {
                 lower: URL(fileURLWithPath: NSString(string: lower).expandingTildeInPath, isDirectory: true),
                 name: value(after: "--name", in: args)
             )
-            if args.contains("--json") { try printJSON(session) }
+            let result = try args.contains("--mount") ? mount(session, with: manager) : session
+            if args.contains("--json") { try printJSON(SessionOutput(result)) }
             else {
-                print("Prepared \(session.name)")
-                print("State: \(session.statePath)")
-                print("Mount: \(session.mountPath) (native mount requires macOS 26)")
+                print(result.status == .mounted ? "Mounted \(result.name)" : "Prepared \(result.name)")
+                print("State: \(result.statePath)")
+                print("Mount: \(result.mountPath)")
             }
+
+        case "mount":
+            let manager = try sessionManager(from: args)
+            guard let id = positional(in: args) else { throw CLIError("mount requires <id>") }
+            let session = try mount(manager.session(id: id), with: manager)
+            print(session.mountPath)
+
+        case "unmount":
+            let manager = try sessionManager(from: args)
+            guard let id = positional(in: args) else { throw CLIError("unmount requires <id>") }
+            try unmount(manager.session(id: id), with: manager)
+            print("Unmounted \(id)")
 
         case "list":
             let manager = try sessionManager(from: args)
             let sessions = try manager.list()
-            if args.contains("--json") { try printJSON(sessions) }
+            if args.contains("--json") { try printJSON(sessions.map(SessionOutput.init)) }
             else if sessions.isEmpty { print("No ghosttrees") }
             else {
                 for session in sessions {
@@ -51,7 +64,7 @@ struct GhosttreeCLI {
         case "inspect":
             let manager = try sessionManager(from: args)
             guard let id = positional(in: args) else { throw CLIError("inspect requires <id>") }
-            try printJSON(manager.session(id: id))
+            try printJSON(SessionOutput(manager.session(id: id)))
 
         case "diff":
             let manager = try sessionManager(from: args)
@@ -74,6 +87,9 @@ struct GhosttreeCLI {
             let manager = try sessionManager(from: args)
             guard let id = positional(in: args) else { throw CLIError("destroy requires <id>") }
             guard args.contains("--force") else { throw CLIError("destroy requires --force") }
+            guard try manager.session(id: id).status != .mounted else {
+                throw CLIError("\(id) is mounted; run ghosttree unmount \(id) first")
+            }
             try manager.destroy(id: id)
             print("Destroyed \(id)")
 
@@ -92,6 +108,46 @@ struct GhosttreeCLI {
 
     private static func sessionManager(from args: [String]) throws -> SessionManager {
         try SessionManager(sessionsRoot: stateRoot(from: args))
+    }
+
+    private static func mount(_ session: GhosttreeSession, with manager: SessionManager) throws -> GhosttreeSession {
+        guard operatingSystemSupportsNativeMounts else {
+            throw CLIError("native mounts require macOS 26 or newer")
+        }
+        if session.status == .mounted { return session }
+
+        let mountURL = URL(fileURLWithPath: session.mountPath, isDirectory: true)
+        try FileManager.default.createDirectory(at: mountURL, withIntermediateDirectories: true)
+        try runProcess("/sbin/mount", arguments: ["-t", "ghosttree", session.statePath, session.mountPath])
+        return try manager.setStatus(.mounted, for: session.id)
+    }
+
+    private static func unmount(_ session: GhosttreeSession, with manager: SessionManager) throws {
+        if session.status == .mounted {
+            try runProcess("/sbin/umount", arguments: [session.mountPath])
+            _ = try manager.setStatus(.prepared, for: session.id)
+        }
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: session.mountPath, isDirectory: true))
+    }
+
+    private static func runProcess(_ executable: String, arguments: [String]) throws {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw CLIError(message.isEmpty ? "\(executable) failed with status \(process.terminationStatus)" : message)
+        }
+    }
+
+    private static var operatingSystemSupportsNativeMounts: Bool {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
     }
 
     private static func stateRoot(from args: [String]) -> URL? {
@@ -131,7 +187,9 @@ struct GhosttreeCLI {
         ghosttree — instant copy-on-write directory overlays for macOS
 
         Usage:
-          ghosttree create --lower <directory> [--name <name>] [--json]
+          ghosttree create --lower <directory> [--name <name>] [--mount] [--json]
+          ghosttree mount <id>
+          ghosttree unmount <id>
           ghosttree list [--json]
           ghosttree inspect <id>
           ghosttree diff <id> [--json]
@@ -146,4 +204,24 @@ struct GhosttreeCLI {
 private struct CLIError: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
+}
+
+private struct SessionOutput: Encodable {
+    let id: String
+    let name: String
+    let lowerPath: String
+    let statePath: String
+    let mountPath: String
+    let createdAt: Date
+    let status: GhosttreeSession.Status
+
+    init(_ session: GhosttreeSession) {
+        id = session.id
+        name = session.name
+        lowerPath = session.lowerPath
+        statePath = session.statePath
+        mountPath = session.mountPath
+        createdAt = session.createdAt
+        status = session.status
+    }
 }

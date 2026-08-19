@@ -54,15 +54,6 @@ class GhosttreeFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
     ///   - options: The options to use when loading the resource.
     ///   - replyHandler: The handler to call when load operation is complete with the volume, and any error.
     public func loadResource(resource: FSResource, options: FSTaskOptions, replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
-        // The imported FSKit sample still routes mutations directly to its source.
-        // Refuse mounts until every vnode operation has been connected to the
-        // upper/lower policy in GhosttreeCore; a partial overlay could corrupt the
-        // directory users expect Ghosttree to protect.
-        guard nativeOverlayAdapterIsReady else {
-            Logger.ghosttreefs.error("Native overlay adapter is not enabled in this build")
-            return replyHandler(nil, POSIXError(.ENOTSUP))
-        }
-
         guard let urlResource = resource as? FSPathURLResource else {
             Logger.ghosttreefs.debug("\(#function): Invalid resource type")
             return replyHandler(nil, POSIXError(.EINVAL))
@@ -89,15 +80,13 @@ class GhosttreeFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         self.resource = urlResource
         do {
             self.containerStatus = .ready
-            return replyHandler(try GhosttreeFSVolume(rootPath: urlResource.url.path), nil)
+            return replyHandler(try GhosttreeFSVolume(statePath: urlResource.url.path), nil)
         } catch let error {
             urlResource.url.stopAccessingSecurityScopedResource()
             self.resource = nil
             return replyHandler(nil, error)
         }
     }
-
-    private var nativeOverlayAdapterIsReady: Bool { false }
 
     ///  Performs an operation to unload a resource.
     /// - Parameters:
@@ -130,6 +119,10 @@ class GhosttreeFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         guard let urlResource = resource as? FSPathURLResource else {
             Logger.ghosttreefs.debug("\(#function): Can't cast resource")
             return replyHandler(nil, POSIXError(.ENODEV))
+        }
+
+        guard (try? GhosttreeSession.load(from: urlResource.url)) != nil else {
+            return replyHandler(nil, POSIXError(.EINVAL))
         }
 
         let name            = createVolumeNameFromPath(urlResource.url.path())

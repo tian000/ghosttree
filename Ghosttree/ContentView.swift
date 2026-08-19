@@ -23,7 +23,7 @@ struct ContentView: View {
 
             Text("CLI quick start")
                 .font(.headline)
-            Text("ghosttree create --lower ~/projects --name experiment")
+            Text("ghosttree create --lower ~/projects --name experiment --mount")
                 .font(.system(.body, design: .monospaced))
                 .textSelection(.enabled)
 

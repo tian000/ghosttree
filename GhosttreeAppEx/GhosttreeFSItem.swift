@@ -2,159 +2,102 @@
 See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
-A class that defines a custom item for use by the ghosttree file system.
+An FSKit item whose identity is an overlay-relative path and whose backing URL
+can move from the lower layer to the upper layer after copy-up.
 */
 
-import Foundation
 import ExtensionFoundation
+import Foundation
 import FSKit
 import OSLog
 
-/// Defined item open modes.
 enum GhosttreeFSItemOpenMode: Int32 {
-    /// Close mode
     case close = -1
-    /// Read-only mode
     case readOnly = 0
-    /// Read and write mode
     case readWrite = 1
 }
 
-/// A GhosttreeFSItem represents a file system item.
-class GhosttreeFSItem: FSItem {
-
-    /// File descriptor of the item
-    var fileDescriptor: Int32
-    /// Open mode of the item
-    var openMode: GhosttreeFSItemOpenMode
-    /// Parent item (for a root item, the parent is nil)
-    var parent: GhosttreeFSItem?
-    /// Name of the item
+final class GhosttreeFSItem: FSItem {
+    var fileDescriptor: Int32 = -1
+    var openMode: GhosttreeFSItemOpenMode = .close
+    weak var parent: GhosttreeFSItem?
     var name: String
-    /// Item type
     var itemType: FSItem.ItemType
-    /// Inode of the item (used to cache items in GhosttreeFSVolume)
     var inode: UInt64
-    /// Dispatch queue for changing the item's GhosttreeFSItemOpenMode
-    var openModeQueue: DispatchQueue
+    private(set) var relativePath: RelativePath
+    private(set) var backingURL: URL
+    private let openModeQueue: DispatchQueue
 
-    /// Creates a new instance of GhosttreeFSItem, to create the root item.
-    /// - Parameters:
-    ///   - name: The name of the item.
-    ///   - fileDescriptor: The file descriptor of the item.
-    ///   - type: The type of the item.
-    ///   - openFlags: The open mode of the item.
-    init(name: String, fileDescriptor: Int32, type: FSItem.ItemType, openFlags: GhosttreeFSItemOpenMode) {
-        self.name           = name
-        self.parent         = nil
-        self.fileDescriptor = fileDescriptor
-        self.itemType       = type
-        self.openMode       = openFlags
-        self.inode          = 0
-        self.openModeQueue = DispatchQueue(label: "dev.ghosttree.fs.item.\(name).openmode.queue")
+    init(
+        path: RelativePath,
+        backingURL: URL,
+        type: FSItem.ItemType,
+        parent: GhosttreeFSItem? = nil,
+        openMode: GhosttreeFSItemOpenMode = .close
+    ) throws {
+        self.relativePath = path
+        self.backingURL = backingURL
+        self.name = path.components.last ?? "."
+        self.itemType = type
+        self.parent = parent
+        self.inode = Self.identifier(for: path)
+        self.openModeQueue = DispatchQueue(label: "dev.ghosttree.fs.item.\(self.inode).openmode.queue")
         super.init()
-        try? self.initInode()
+
+        if openMode != .close {
+            try upgradeOpenMode(mode: openMode)
+        }
     }
 
-    /// Creates a new instance of GhosttreeFSItem.
-    /// - Parameters:
-    ///   - name: The name of the item.
-    ///   - parent: The parent item.
-    ///   - type: The type of the item.
-    init(name: String, parent: GhosttreeFSItem, type: FSItem.ItemType) throws {
-        self.name           = name
-        self.parent         = parent
-        self.openMode       = .close
-        self.fileDescriptor = -1
-        self.itemType       = type
-        self.inode          = 0
-        self.openModeQueue  = DispatchQueue(label: "dev.ghosttree.fs.item.\(name).openmode.queue")
-        super.init()
-        try self.upgradeOpenMode(mode: .readOnly)
-        try self.initInode()
-        try self.closeItem()
+    func rebind(to backingURL: URL) throws {
+        try openModeQueue.sync {
+            if fileDescriptor >= 0 {
+                _ = try throwErrno { Darwin.close(fileDescriptor) }
+            }
+            self.backingURL = backingURL
+            fileDescriptor = -1
+            openMode = .close
+        }
     }
 
-    /// Initializes the inode number of the item.
-    private func initInode() throws {
-        var statResult = stat()
-        _ = try throwErrno { fstat(self.fileDescriptor, &statResult) }
-        self.inode = statResult.st_ino
+    func relocate(to path: RelativePath, backingURL: URL, parent: GhosttreeFSItem?) throws {
+        try rebind(to: backingURL)
+        self.relativePath = path
+        self.name = path.components.last ?? "."
+        self.parent = parent
     }
 
-    /// Opens the item with given mode using `openat`, and if successful, returns a new file descriptor, otherwise throwing errno.
-    ///
-    /// In order for `openat` to work, the file system needs the parent's item file descriptor. If the parent doesn't have one,
-    /// this method opens the parent item to get its file descriptor. After opening the item,
-    /// this closes the parent item file descriptor, if it wasn't open before.
-    private func openWithMode(mode: GhosttreeFSItemOpenMode) throws -> Int32 {
-        guard let parent = self.parent else {
-            Logger.ghosttreefs.error("\(#function): The parent is nil, can't open the item (\(self.name))")
-            return -1
-        }
-        var parentFD = parent.fileDescriptor
-        let oldParentFD = parentFD
-
-        // Check if the parent is open; if not, open it also.
-        if oldParentFD == -1 {
-            try parent.upgradeOpenMode(mode: .readOnly)
-            parentFD = parent.fileDescriptor
-        }
-
-        // Convert GhosttreeFSItemOpenMode to O_RDONLY/O_RDWR.
-        var convertedMode = O_RDONLY
-        if mode == .readWrite {
-            convertedMode = O_RDWR
-        }
-        // Open the file.
-        let fileDescriptor = try throwErrno { openat(parentFD, self.name, convertedMode | O_SYMLINK) }
-
-        // If the parent was closed, before opening the file, close it.
-        if oldParentFD == -1 {
-            try parent.closeItem()
-        }
-
-        // Return the file descriptor of the item.
-        return fileDescriptor
-    }
-
-    /// Upgrades the open mode of the item to the given mode.
-    ///
-    /// Upgrade means that the item can go from .close to .readOnly to .readWrite.
-    /// If the item was opened to a .readOnly and needs to upgrade to .readWrite, this method creates a new file descriptor for the .readWrite mode,
-    /// and closes the old .readOnly file descriptor.
     func upgradeOpenMode(mode: GhosttreeFSItemOpenMode) throws {
-        if mode == .close {
-            Logger.ghosttreefs.error("\(#function): Can't pass .close as mode")
-            throw POSIXError(.EINVAL)
-        }
-        if (self.fileDescriptor != -1) && (self.openMode == .readWrite || self.openMode == mode) {
-            // The item already has a file descriptor and mode is set, so there is nothing to do.
-            return
-        }
+        guard mode != .close else { throw POSIXError(.EINVAL) }
+        if fileDescriptor >= 0 && (openMode == .readWrite || openMode == mode) { return }
 
-        try self.openModeQueue.sync {
-            let oldFD = self.fileDescriptor
-            try self.fileDescriptor = self.openWithMode(mode: mode)
-
-            // With a new fileDescriptor set, close the old file descriptor if it exists.
-            if oldFD > 0 {
-                _ = try throwErrno { Darwin.close(oldFD) }
+        try openModeQueue.sync {
+            let flags = mode == .readWrite ? O_RDWR : O_RDONLY
+            let newDescriptor = try throwErrno { Darwin.open(backingURL.path, flags | O_SYMLINK) }
+            if fileDescriptor >= 0 {
+                _ = try throwErrno { Darwin.close(fileDescriptor) }
             }
-            self.openMode = mode
+            fileDescriptor = newDescriptor
+            openMode = mode
         }
     }
 
-    /// Closes the item by calling `close`.
     func closeItem() throws {
-        try self.openModeQueue.sync {
-            if self.fileDescriptor == -1 || self.openMode == .close {
-                return
-            }
-            _ = try throwErrno { Darwin.close(self.fileDescriptor) }
-            self.fileDescriptor = -1
-            self.openMode = .close
+        try openModeQueue.sync {
+            guard fileDescriptor >= 0 else { return }
+            _ = try throwErrno { Darwin.close(fileDescriptor) }
+            fileDescriptor = -1
+            openMode = .close
         }
     }
 
+    private static func identifier(for path: RelativePath) -> UInt64 {
+        if path.isRoot { return 2 }
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in path.description.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return max(hash, 3)
+    }
 }

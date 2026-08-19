@@ -23,6 +23,11 @@ class GhosttreeFSVolume: FSVolume,
     /// The default UUID for the GhosttreeFSVolume.
     static let defaultVolumeUUID = UUID()
 
+    let session: GhosttreeSession
+    let overlay: OverlayStore
+    private let lowerAccessURL: URL
+    private var lowerAccessIsActive: Bool
+
     /// The root item of the volume.
     var rootItem: GhosttreeFSItem
 
@@ -34,14 +39,101 @@ class GhosttreeFSVolume: FSVolume,
     var itemCacheQueue: DispatchQueue
 
     /// Creates a new GhosttreeFSVolume.
-    /// - Parameter rootPath: The path to the root directory of the volume.
-    init(rootPath: String) throws {
-        let rootFD      = try throwErrno { Darwin.open(rootPath, O_RDONLY) }
-        self.rootItem   = GhosttreeFSItem(name: ".", fileDescriptor: rootFD, type: .directory, openFlags: .readOnly)
+    /// - Parameter statePath: The path to a prepared Ghosttree session.
+    init(statePath: String) throws {
+        let stateURL = URL(fileURLWithPath: statePath, isDirectory: true)
+        self.session = try GhosttreeSession.load(from: stateURL)
+        if let bookmark = session.lowerBookmark {
+            var isStale = false
+            self.lowerAccessURL = try URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withoutUI, .withoutImplicitStartAccessing],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        } else {
+            self.lowerAccessURL = URL(fileURLWithPath: session.lowerPath, isDirectory: true)
+        }
+        let lowerAccessIsActive = lowerAccessURL.startAccessingSecurityScopedResource()
+        self.lowerAccessIsActive = lowerAccessIsActive
+        do {
+            self.overlay = try OverlayStore(lowerRoot: lowerAccessURL, stateRoot: stateURL)
+        } catch {
+            if lowerAccessIsActive { lowerAccessURL.stopAccessingSecurityScopedResource() }
+            throw error
+        }
+        self.rootItem = try GhosttreeFSItem(
+            path: .root,
+            backingURL: overlay.upperRoot,
+            type: .directory,
+            openMode: .readOnly
+        )
         self.itemCache = [:]
         self.itemCacheQueue = DispatchQueue(label: "dev.ghosttree.fs.itemcache.queue")
-        super.init(volumeID: FSVolume.Identifier(uuid: GhosttreeFSVolume.defaultVolumeUUID), volumeName: createVolumeNameFromPath(rootPath))
-        Logger.ghosttreefs.info("\(#function): Created a new volume with ID(\(self.volumeID)) and name(\(self.name)) on path(\(rootPath))")
+        super.init(volumeID: FSVolume.Identifier(uuid: GhosttreeFSVolume.defaultVolumeUUID), volumeName: FSFileName(string: session.name))
+        Logger.ghosttreefs.info("\(#function): Created overlay volume for session \(self.session.id)")
+    }
+
+    func releaseLowerAccess() {
+        guard lowerAccessIsActive else { return }
+        lowerAccessURL.stopAccessingSecurityScopedResource()
+        lowerAccessIsActive = false
+    }
+
+    func prepareForMutation(_ item: GhosttreeFSItem, recursively: Bool = false) throws {
+        guard !item.relativePath.isRoot else { return }
+        let upperURL = try overlay.mutableURL(for: item.relativePath, recursively: recursively)
+        if item.backingURL != upperURL {
+            try item.rebind(to: upperURL)
+        }
+    }
+
+    func item(at path: RelativePath, parent: GhosttreeFSItem?) throws -> GhosttreeFSItem {
+        guard let entry = overlay.entry(at: path) else { throw POSIXError(.ENOENT) }
+        var statResult = stat()
+        guard lstat(entry.url.path, &statResult) == 0 else { throw posixErrno }
+        let type: FSItem.ItemType
+        switch statResult.st_mode & S_IFMT {
+        case S_IFDIR: type = .directory
+        case S_IFLNK: type = .symlink
+        default: type = .file
+        }
+        return try GhosttreeFSItem(path: path, backingURL: entry.url, type: type, parent: parent)
+    }
+
+    func relocateCachedItems(
+        from source: RelativePath,
+        to destination: RelativePath,
+        movedItem: GhosttreeFSItem,
+        destinationParent: GhosttreeFSItem
+    ) throws {
+        var cached = itemCacheQueue.sync { Array(itemCache.values) }
+        if !cached.contains(where: { $0 === movedItem }) { cached.append(movedItem) }
+
+        let affected = cached
+            .filter { $0.relativePath.components.starts(with: source.components) }
+            .sorted { $0.relativePath.components.count < $1.relativePath.components.count }
+        var relocatedByPath: [RelativePath: GhosttreeFSItem] = [:]
+
+        for item in affected {
+            let suffix = item.relativePath.components.dropFirst(source.components.count)
+            let newPath = try RelativePath(components: destination.components + suffix)
+            guard let entry = overlay.entry(at: newPath) else { throw POSIXError(.ENOENT) }
+            let newParent: GhosttreeFSItem?
+            if newPath == destination {
+                newParent = destinationParent
+            } else if let parentPath = newPath.parent {
+                newParent = relocatedByPath[parentPath] ?? item.parent
+            } else {
+                newParent = nil
+            }
+            try item.relocate(to: newPath, backingURL: entry.url, parent: newParent)
+            relocatedByPath[newPath] = item
+        }
+
+        itemCacheQueue.sync {
+            itemCache = Dictionary(uniqueKeysWithValues: cached.map { ($0.inode, $0) })
+        }
     }
 
     /// The GhosttreeFS file system doesn't support setting a volume name, so this method does nothing and invokes its reply handler.
@@ -68,6 +160,12 @@ class GhosttreeFSVolume: FSVolume,
         guard ptItem.itemType == .file else {
             Logger.ghosttreefs.error("\(#function): Can only preallocate a file")
             return replyHandler(0, POSIXError(.EPERM))
+        }
+
+        do {
+            try prepareForMutation(ptItem)
+        } catch {
+            return replyHandler(0, error)
         }
 
         var preallocStruct = fstore_t()
@@ -155,6 +253,13 @@ class GhosttreeFSVolume: FSVolume,
             return replyHandler(0, POSIXError(.EISDIR))
         }
 
+        do {
+            try prepareForMutation(ptItem)
+            try ptItem.upgradeOpenMode(mode: .readWrite)
+        } catch {
+            return replyHandler(0, error)
+        }
+
         let bytesPtr: UnsafeMutablePointer<UInt8> = UnsafeMutablePointer<UInt8>.allocate(capacity: contents.count)
         contents.copyBytes(to: bytesPtr, count: contents.count)
 
@@ -196,6 +301,9 @@ class GhosttreeFSVolume: FSVolume,
         }
 
         do {
+            if modes.contains(.write) {
+                try prepareForMutation(ptItem)
+            }
             try ptItem.upgradeOpenMode(mode: ptfsMode)
         } catch {
             return replyHandler(error)

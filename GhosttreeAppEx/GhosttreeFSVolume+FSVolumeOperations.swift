@@ -66,6 +66,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
     public func deactivate(options: FSDeactivateOptions = [],
                            replyHandler: @escaping ((any Error)?) -> Void) {
         try? self.rootItem.closeItem()
+        self.releaseLowerAccess()
         return replyHandler(nil)
     }
 
@@ -78,6 +79,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
     /// Unmount closes the root item.
     public func unmount(replyHandler: @escaping () -> Void) {
         try? self.rootItem.closeItem()
+        self.releaseLowerAccess()
         return replyHandler()
     }
 
@@ -193,11 +195,11 @@ extension GhosttreeFSVolume: FSVolume.Operations {
         }
 
         if desiredAttributes.isAttributeWanted(.fileID) {
-            attrs.fileID = FSItem.Identifier(rawValue: statResult.st_ino) ?? .invalid
+            attrs.fileID = FSItem.Identifier(rawValue: ptItem.inode) ?? .invalid
         }
 
         if desiredAttributes.isAttributeWanted(.parentID) {
-            attrs.parentID = FSItem.Identifier(rawValue: commonAttrsBuf.parentID) ?? .invalid
+            attrs.parentID = FSItem.Identifier(rawValue: ptItem.parent?.inode ?? self.rootItem.inode) ?? .invalid
         }
 
         if desiredAttributes.isAttributeWanted(.type) {
@@ -266,6 +268,12 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             // Bits outside of the supported mode bits are specified.
             Logger.ghosttreefs.error("\(#function): Invalid mode bits for item (\(ptItem.name)), returning EINVAL")
             return replyHandler(nil, POSIXError(.EINVAL))
+        }
+
+        do {
+            try self.prepareForMutation(ptItem)
+        } catch {
+            return replyHandler(nil, error)
         }
 
         var getAttrs: FSItem.Attributes?
@@ -438,53 +446,36 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             return replyHandler(nil, nil, POSIXError(.EINVAL))
         }
 
-        // Check if item exists in item cache.
-        let type: FSItem.ItemType
-        var statResult = stat()
-        let oldFD = dirItem.fileDescriptor
+        let path: RelativePath
         do {
-            if oldFD < 0 {
-                try? dirItem.upgradeOpenMode(mode: .readOnly)
-            }
-            _ = try throwErrno { fstatat(dirItem.fileDescriptor, nameString, &statResult, AT_SYMLINK_NOFOLLOW) }
-            if oldFD < 0 {
-                try? dirItem.closeItem()
-            }
-            let inode = statResult.st_ino
-            var val: GhosttreeFSItem?
+            path = try dirItem.relativePath.appending(nameString)
+            var cached: GhosttreeFSItem?
             self.itemCacheQueue.sync {
-                val = self.itemCache[inode]
+                cached = self.itemCache.values.first { $0.relativePath == path }
             }
-            if val != nil {
-                return replyHandler(val, nil, nil)
-            }
-            switch statResult.st_mode & S_IFMT {
-            case S_IFDIR:
-                type = FSItem.ItemType.directory
-            case S_IFLNK:
-                type = FSItem.ItemType.symlink
-            default:
-                type = FSItem.ItemType.file
+            if let cached {
+                guard let entry = self.overlay.entry(at: path) else {
+                    return replyHandler(nil, nil, POSIXError(.ENOENT))
+                }
+                if cached.backingURL != entry.url {
+                    try cached.rebind(to: entry.url)
+                }
+                return replyHandler(cached, name, nil)
             }
         } catch {
             return replyHandler(nil, nil, error)
         }
 
-        // Item isn't in the item cache, create a new item, update the cache,  and return it.
-        var newItem: GhosttreeFSItem
         do {
-            newItem = try GhosttreeFSItem(name: nameString, parent: dirItem, type: type)
+            let newItem = try self.item(at: path, parent: dirItem)
+            self.itemCacheQueue.sync {
+                self.itemCache[newItem.inode] = newItem
+            }
+            return replyHandler(newItem, name, nil)
         } catch {
             Logger.ghosttreefs.error("\(#function): Can't create new item (\(name.debugDescription)) error (\(error)")
             return replyHandler(nil, nil, error)
         }
-
-        if newItem.inode != 0 {
-            self.itemCacheQueue.sync {
-                self.itemCache[newItem.inode] = newItem
-            }
-        }
-        return replyHandler(newItem, name, nil)
     }
 
     /// Performs reclamation of an item, by removing the item from the item cache, and closing it.
@@ -528,7 +519,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             buf.deallocate()
             replyHandler(nil, posixErrno)
             if oldFD < 0 {
-                try? ptItem.upgradeOpenMode(mode: .close)
+                try? ptItem.closeItem()
             }
             return
         }
@@ -536,7 +527,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
         buf.deallocate()
         replyHandler(FSFileName(data: data), nil)
         if oldFD < 0 {
-            try? ptItem.upgradeOpenMode(mode: .close)
+            try? ptItem.closeItem()
         }
     }
 
@@ -567,43 +558,19 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             return replyHandler(nil, nil, POSIXError(.EINVAL))
         }
 
-        let oldDirItemFD = dirItem.fileDescriptor
-        if oldDirItemFD < 0 {
-            try? dirItem.upgradeOpenMode(mode: .readOnly)
-        }
-
-        var newItem: GhosttreeFSItem
-        var error: Int32 = -1
-        var fileDescriptor: Int32 = -1
-        nameString.withCString({ namePtr in
-            switch type {
-            case FSItem.ItemType.directory:
-                error = mkdirat(dirItem.fileDescriptor, namePtr, S_IRWXU)
-            case FSItem.ItemType.file:
-                let createFlags = O_RDWR | O_CREAT | O_NOFOLLOW | O_SYMLINK | O_EXCL
-                fileDescriptor = openat(dirItem.fileDescriptor, namePtr, createFlags, S_IRWXU)
-                if fileDescriptor >= 0 {
-                    // Closing the fd, as we're about to open the file again when creating the item.
-                    // (that way we have the same flow for files and dirs).
-                    error = Darwin.close(fileDescriptor)
-                } else {
-                    error = -1
-                }
-            default:
-                error = -1
-                errno = EINVAL
-            }
-        })
-        guard error != -1 else {
-            return replyHandler(nil, nil, posixErrno)
-        }
-
-        if oldDirItemFD < 0 {
-            try? dirItem.closeItem()
-        }
-
+        let path: RelativePath
+        let newItem: GhosttreeFSItem
         do {
-            try newItem = GhosttreeFSItem(name: nameString, parent: dirItem, type: type)
+            path = try dirItem.relativePath.appending(nameString)
+            switch type {
+            case .directory:
+                try overlay.createDirectory(at: path)
+            case .file:
+                _ = try overlay.createFile(at: path)
+            default:
+                throw POSIXError(.EINVAL)
+            }
+            newItem = try self.item(at: path, parent: dirItem)
         } catch {
             return replyHandler(nil, nil, error)
         }
@@ -639,7 +606,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             Logger.ghosttreefs.error("\(#function): Can't cast dirItem")
             return replyHandler(nil, nil, POSIXError(.EINVAL))
         }
-        guard dirItem != self.rootItem && dirItem.itemType != .directory else {
+        guard dirItem.itemType == .directory else {
             Logger.ghosttreefs.error("\(#function): Invalid directory given")
             return replyHandler(nil, nil, POSIXError(.ENOTDIR))
         }
@@ -652,24 +619,18 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             return replyHandler(nil, nil, POSIXError(.EINVAL))
         }
 
-        var newItem: GhosttreeFSItem
-        var error: Int32 = -1
-        nameString.withCString({ namePtr in
-            let contentsString = String(decoding: contents.data, as: Unicode.UTF8.self)
-            error = symlinkat(contentsString, dirItem.fileDescriptor, namePtr)
-        })
-        if error == -1 {
-            return replyHandler(nil, nil, posixErrno)
-        }
-
+        let newItem: GhosttreeFSItem
         do {
-            try newItem = GhosttreeFSItem(name: nameString, parent: dirItem, type: FSItem.ItemType.symlink)
+            let path = try dirItem.relativePath.appending(nameString)
+            let contentsString = String(decoding: contents.data, as: Unicode.UTF8.self)
+            _ = try overlay.createSymbolicLink(at: path, destination: contentsString)
+            newItem = try self.item(at: path, parent: dirItem)
         } catch {
             return replyHandler(nil, nil, error)
         }
 
         self.setAttributes(newAttributes, on: newItem, creatingNewFile: true, replyHandler: { (attrs, error) -> Void in
-            guard error != nil else {
+            guard error == nil else {
                 return replyHandler(nil, nil, error)
             }
             self.itemCacheQueue.sync {
@@ -697,7 +658,7 @@ extension GhosttreeFSVolume: FSVolume.Operations {
                            named name: FSFileName,
                            fromDirectory directory: FSItem,
                            replyHandler: @escaping (Error?) -> Void) {
-        guard let dirItem = directory as? GhosttreeFSItem else {
+        guard directory is GhosttreeFSItem else {
             Logger.ghosttreefs.error("\(#function): Can't cast dirItem")
             return replyHandler(POSIXError(.EINVAL))
         }
@@ -705,23 +666,15 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             Logger.ghosttreefs.error("\(#function): Can't cast item")
             return replyHandler(POSIXError(.EINVAL))
         }
-        guard let nameString = name.string else {
+        guard name.string != nil else {
             Logger.ghosttreefs.error("\(#function): Invalid name given")
             return replyHandler(POSIXError(.EINVAL))
         }
 
-        let unlinkFlags = (ptItem.itemType == FSItem.ItemType.directory) ? AT_REMOVEDIR : 0
-        var error: Int32 = -1
-
-        let oldDirItemFD = dirItem.fileDescriptor
-        if oldDirItemFD < 0 {
-            try? dirItem.upgradeOpenMode(mode: .readOnly)
-        }
-        nameString.withCString({ namePtr in
-            error = unlinkat(dirItem.fileDescriptor, namePtr, unlinkFlags)
-        })
-        if error == -1 {
-            return replyHandler(posixErrno)
+        do {
+            try overlay.remove(ptItem.relativePath)
+        } catch {
+            return replyHandler(error)
         }
 
         // Remove from item cache the item.
@@ -731,11 +684,6 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             }
         }
         replyHandler(nil)
-
-        // Close the directory, since it was closed when the call entered this method.
-        if oldDirItemFD < 0 {
-            try? dirItem.closeItem()
-        }
     }
 
     /// Performs a rename operation on a file system item.
@@ -767,50 +715,28 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             return replyHandler(nil, POSIXError(.EINVAL))
         }
 
-        let fromItemInode = fromItem.inode
-
-        var toItemInode: UInt64 = 0
-        if overItem != nil {
-            guard let toItem = overItem as? GhosttreeFSItem else {
-                Logger.ghosttreefs.error("\(#function): Can't cast toItem")
-                return replyHandler(nil, POSIXError(.EINVAL))
+        guard let sourceString = sourceName.string,
+              let destinationString = destinationName.string else {
+            return replyHandler(nil, POSIXError(.EINVAL))
+        }
+        do {
+            let sourcePath = try fromDir.relativePath.appending(sourceString)
+            let destinationPath = try toDir.relativePath.appending(destinationString)
+            try overlay.move(sourcePath, to: destinationPath)
+            if let overwritten = overItem as? GhosttreeFSItem, overwritten !== fromItem {
+                itemCacheQueue.sync { itemCache.removeValue(forKey: overwritten.inode) }
+                try? overwritten.closeItem()
             }
-            toItemInode = toItem.inode
+            try self.relocateCachedItems(
+                from: sourcePath,
+                to: destinationPath,
+                movedItem: fromItem,
+                destinationParent: toDir
+            )
+            return replyHandler(destinationName, nil)
+        } catch {
+            return replyHandler(nil, error)
         }
-        // Perform rename call.
-        var retVal: Int32 = -1
-        let sourceString = sourceName.string
-        let destinationString = destinationName.string
-        sourceString!.withCString { fromName in
-            destinationString!.withCString { toName in
-                retVal = renameatx_np(fromDir.fileDescriptor, fromName, toDir.fileDescriptor, toName, 0)
-            }
-        }
-
-        if retVal == -1 {
-            return replyHandler(nil, posixErrno)
-        }
-
-        // Update fromItem.
-        fromItem.name = destinationString!
-        fromItem.parent = toDir
-        // Update itemCache
-        self.itemCacheQueue.sync {
-            // Remove old inode.
-            self.itemCache.removeValue(forKey: fromItemInode)
-            // Add new inode.
-            self.itemCache[fromItem.inode] = fromItem
-        }
-
-        // If overItem did exist, remove it from the item cache
-        if overItem != nil && overItem != fromItem {
-            if toItemInode != 0 {
-                _ = self.itemCacheQueue.sync {
-                    self.itemCache.removeValue(forKey: toItemInode)
-                }
-            }
-        }
-        return replyHandler(destinationName, nil)
     }
 
     /// Performs an enumeration of the contents of a directory.
@@ -837,81 +763,35 @@ extension GhosttreeFSVolume: FSVolume.Operations {
             return replyHandler(FSDirectoryVerifier(0), fs_errorForPOSIXError(ENOTDIR))
         }
 
-        let oldFD = dirItem.fileDescriptor
-        if oldFD == -1 {
-            try? dirItem.upgradeOpenMode(mode: .readOnly)
-        }
-
-        let dirp = fdopendir(dirItem.fileDescriptor)
-        if dirp == nil {
-            return replyHandler(FSDirectoryVerifier(0), posixErrno)
-        }
-        if cookie.rawValue == 0 {
-            rewinddir(dirp)
-        } else {
-            seekdir(dirp, Int(cookie.rawValue))
-        }
-
-        var dirent: UnsafeMutablePointer<dirent>? = readdir(dirp)
-        while dirent != nil {
-            guard let safeDirent = dirent else {
-                dirent = readdir(dirp)
-                continue
-            }
-
-            // Extract the filename from the C structure.
-            let filename = withUnsafePointer(to: &safeDirent.pointee.d_name) { namePtr -> String in
-                let nameLength = Int(safeDirent.pointee.d_namlen)
-                let capacity = MemoryLayout<UInt8>.size * nameLength
-                return namePtr.withMemoryRebound(to: UInt8.self, capacity: capacity) { arrayPtr in
-                    return String(cString: arrayPtr)
-                }
-            }
-
-            if filename == "." || filename == ".." {
-                dirent = readdir(dirp)
-                continue
-            }
-
-            var fsItemType = FSItem.ItemType.file
-            let type = safeDirent.pointee.d_type
-            if type == DT_DIR {
-                fsItemType = FSItem.ItemType.directory
-            }
-            let itemID = safeDirent.pointee.d_ino
-            let nextCookie = telldir(dirp)
-            var itemAttributes: FSItem.Attributes? = nil
-            dirent = readdir(dirp)
-            if attributes != nil {
-                self.lookupItem(named: FSFileName(string: filename), inDirectory: dirItem) { lookupItem, itemName, error in
-                    if error == nil {
-                        self.getAttributes(attributes!, of: lookupItem!) { innerItemAttributes, innerError in
-                            if innerError == nil {
-                                itemAttributes = innerItemAttributes
-                            } else {
-                                Logger.ghosttreefs.error("\(#function): Can't get attributes of \(filename)")
-                            }
-                        }
-                    } else {
-                        Logger.ghosttreefs.error("\(#function): Can't lookup \(filename)")
+        do {
+            let names = try overlay.contentsOfDirectory(at: dirItem.relativePath)
+            let startIndex = min(Int(cookie.rawValue), names.count)
+            for index in startIndex..<names.count {
+                let filename = names[index]
+                let childPath = try dirItem.relativePath.appending(filename)
+                let child = try self.item(at: childPath, parent: dirItem)
+                var itemAttributes: FSItem.Attributes?
+                if let attributes {
+                    var attributeError: Error?
+                    self.getAttributes(attributes, of: child) { result, error in
+                        itemAttributes = result
+                        attributeError = error
                     }
+                    if let attributeError { throw attributeError }
                 }
+                let packed = packer.packEntry(
+                    name: FSFileName(string: filename),
+                    itemType: child.itemType,
+                    itemID: FSItem.Identifier(rawValue: child.inode) ?? .invalid,
+                    nextCookie: FSDirectoryCookie(UInt64(index + 1)),
+                    attributes: itemAttributes
+                )
+                if !packed { break }
             }
-            let packerRes = packer.packEntry(name: FSFileName(string: filename),
-                                             itemType: fsItemType,
-                                             itemID: FSItem.Identifier(rawValue: itemID) ?? FSItem.Identifier.invalid,
-                                             nextCookie: FSDirectoryCookie(UInt64(nextCookie)),
-                                             attributes: itemAttributes)
-            if packerRes == false {
-                break
-            }
+            return replyHandler(FSDirectoryVerifier(0), nil)
+        } catch {
+            return replyHandler(FSDirectoryVerifier(0), error)
         }
-
-        if oldFD == -1 {
-            try? dirItem.closeItem()
-        }
-
-        return replyHandler(FSDirectoryVerifier(0), nil)
     }
 
     /// Returns `true` if the volume supports the specified capability, otherwise returns `false`.
@@ -939,20 +819,20 @@ extension GhosttreeFSVolume: FSVolume.Operations {
     public var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let capabilities = FSVolume.SupportedCapabilities()
         capabilities.supportsSymbolicLinks                  = self.volumeSupportsCapability(capability: VOL_CAP_FMT_SYMBOLICLINKS)
-        capabilities.supportsHardLinks                      = self.volumeSupportsCapability(capability: VOL_CAP_FMT_HARDLINKS)
+        capabilities.supportsHardLinks                      = false
         capabilities.supportsHiddenFiles                    = self.volumeSupportsCapability(capability: VOL_CAP_FMT_HIDDEN_FILES)
-        capabilities.supportsPersistentObjectIDs            = self.volumeSupportsCapability(capability: VOL_CAP_FMT_PERSISTENTOBJECTIDS)
-        capabilities.supportsJournal                        = self.volumeSupportsCapability(capability: VOL_CAP_FMT_JOURNAL)
-        capabilities.supportsActiveJournal                  = self.volumeSupportsCapability(capability: VOL_CAP_FMT_JOURNAL_ACTIVE)
+        capabilities.supportsPersistentObjectIDs            = false
+        capabilities.supportsJournal                        = false
+        capabilities.supportsActiveJournal                  = false
         capabilities.supportsSparseFiles                    = self.volumeSupportsCapability(capability: VOL_CAP_FMT_SPARSE_FILES)
         capabilities.supportsZeroRuns                       = self.volumeSupportsCapability(capability: VOL_CAP_FMT_ZERO_RUNS)
         capabilities.supportsFastStatFS                     = self.volumeSupportsCapability(capability: VOL_CAP_FMT_FAST_STATFS)
         capabilities.supports2TBFiles                       = self.volumeSupportsCapability(capability: VOL_CAP_FMT_2TB_FILESIZE)
         capabilities.supportsOpenDenyModes                  = self.volumeSupportsCapability(capability: VOL_CAP_FMT_OPENDENYMODES)
         capabilities.supports64BitObjectIDs                 = self.volumeSupportsCapability(capability: VOL_CAP_FMT_64BIT_OBJECT_IDS)
-        capabilities.supportsDocumentID                     = self.volumeSupportsCapability(capability: VOL_CAP_FMT_DOCUMENT_ID)
+        capabilities.supportsDocumentID                     = false
         capabilities.supportsSharedSpace                    = self.volumeSupportsCapability(capability: VOL_CAP_FMT_SHARED_SPACE)
-        capabilities.supportsVolumeGroups                   = self.volumeSupportsCapability(capability: VOL_CAP_FMT_VOL_GROUPS)
+        capabilities.supportsVolumeGroups                   = false
         capabilities.doesNotSupportVolumeSizes              = self.volumeSupportsCapability(capability: VOL_CAP_FMT_NO_VOLUME_SIZES)
         capabilities.doesNotSupportImmutableFiles           = self.volumeSupportsCapability(capability: VOL_CAP_FMT_NO_IMMUTABLE_FILES)
         capabilities.doesNotSupportRootTimes                = self.volumeSupportsCapability(capability: VOL_CAP_FMT_NO_ROOT_TIMES)

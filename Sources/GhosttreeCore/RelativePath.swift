@@ -20,6 +20,23 @@ public enum GhosttreeError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+extension GhosttreeError: CustomNSError {
+    public static var errorDomain: String { NSPOSIXErrorDomain }
+
+    public var errorCode: Int {
+        switch self {
+        case .missingItem, .sessionNotFound: Int(POSIXError.Code.ENOENT.rawValue)
+        case .notDirectory: Int(POSIXError.Code.ENOTDIR.rawValue)
+        case .sessionAlreadyExists: Int(POSIXError.Code.EEXIST.rawValue)
+        case .invalidRelativePath, .invalidSessionName: Int(POSIXError.Code.EINVAL.rawValue)
+        }
+    }
+
+    public var errorUserInfo: [String: Any] {
+        [NSLocalizedDescriptionKey: description]
+    }
+}
+
 public struct RelativePath: Hashable, Codable, Comparable, Sendable, CustomStringConvertible {
     public let components: [String]
 

@@ -9,10 +9,20 @@ public struct GhosttreeSession: Codable, Equatable, Sendable {
     public let id: String
     public let name: String
     public let lowerPath: String
+    public let lowerBookmark: Data?
     public let statePath: String
     public let mountPath: String
     public let createdAt: Date
     public var status: Status
+
+    public static func load(from stateDirectory: URL) throws -> GhosttreeSession {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return try decoder.decode(
+            GhosttreeSession.self,
+            from: Data(contentsOf: stateDirectory.appendingPathComponent("session.json"))
+        )
+    }
 }
 
 public final class SessionManager: @unchecked Sendable {
@@ -47,8 +57,16 @@ public final class SessionManager: @unchecked Sendable {
                 id: name,
                 name: name,
                 lowerPath: lower.standardizedFileURL.path,
+                lowerBookmark: try? lower.standardizedFileURL.bookmarkData(
+                    options: [],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                ),
                 statePath: state.path,
-                mountPath: "/Volumes/ghosttree-\(name)",
+                mountPath: fileManager.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Ghosttrees", isDirectory: true)
+                    .appendingPathComponent(name, isDirectory: true)
+                    .path,
                 createdAt: Date().roundedToMilliseconds,
                 status: .prepared
             )
@@ -91,6 +109,14 @@ public final class SessionManager: @unchecked Sendable {
         try fileManager.removeItem(at: URL(fileURLWithPath: session.statePath, isDirectory: true))
     }
 
+    @discardableResult
+    public func setStatus(_ status: GhosttreeSession.Status, for id: String) throws -> GhosttreeSession {
+        var session = try session(id: id)
+        session.status = status
+        try persist(session)
+        return session
+    }
+
     private func persist(_ session: GhosttreeSession) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
@@ -103,12 +129,7 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     private func loadManifest(at directory: URL) throws -> GhosttreeSession {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .millisecondsSince1970
-        return try decoder.decode(
-            GhosttreeSession.self,
-            from: Data(contentsOf: directory.appendingPathComponent("session.json"))
-        )
+        try GhosttreeSession.load(from: directory)
     }
 
     private func validate(_ name: String) throws {

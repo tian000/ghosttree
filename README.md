@@ -6,21 +6,24 @@ The intended interface is deliberately generic:
 
 ```sh
 ghosttree create --lower ~/src/project --name experiment
+ghosttree mount experiment
 ghosttree list
 ghosttree diff experiment
+ghosttree unmount experiment
 ghosttree destroy experiment --force
 ```
 
 ## Status
 
-This repository is an early, compilable foundation—not yet a usable filesystem mount. It currently contains:
+This repository is an early native implementation. It currently contains:
 
 - a tested Swift overlay policy engine with lazy copy-up, merged directory listings, and whiteouts;
 - persistent session creation, inspection, diffing, and deletion through the `ghosttree` CLI;
-- a macOS app and FSKit file-system extension that compile against the macOS 26 SDK; and
-- a safety gate that prevents the unfinished native adapter from mounting as a writable passthrough.
+- a macOS app and FSKit file-system extension that compile against the macOS 26 SDK;
+- FSKit routing for merged lookup/enumeration, lower-layer reads, copy-up mutations, whiteout deletion, creation, and rename; and
+- CLI `mount` and `unmount` commands using the system's `mount(8)` integration.
 
-The next milestone is to connect FSKit vnode operations to `GhosttreeCore`, then add mount/unmount commands and a signed installer. Native path-backed FSKit file systems require macOS 26 or newer. The package-level policy engine and CLI build on macOS 15 for development.
+Native mounting requires macOS 26 or newer and still needs end-to-end runtime validation on that OS. The package-level policy engine and CLI build on macOS 15 for development.
 
 ## Architecture
 
@@ -58,7 +61,7 @@ To copy a release CLI into a custom prefix:
 make install-cli PREFIX="$HOME/.local"
 ```
 
-Session state defaults to `~/Library/Application Support/Ghosttree/Sessions`. Set `GHOSTTREE_HOME` or pass `--state-root` to use another directory.
+Session state defaults to `~/Library/Application Support/Ghosttree/Sessions`, and mounts default to `~/Ghosttrees/<name>`. Set `GHOSTTREE_HOME` or pass `--state-root` to use another session directory.
 
 ## Installation target
 

@@ -66,6 +66,10 @@ public final class OverlayStore: @unchecked Sendable {
         }
     }
 
+    public func mutableURL(for path: RelativePath, recursively: Bool = false) throws -> URL {
+        try copyUp(path, recursively: recursively)
+    }
+
     public func read(_ path: RelativePath) throws -> Data {
         guard let entry = entry(at: path) else { throw GhosttreeError.missingItem(path.description) }
         return try Data(contentsOf: entry.url)
@@ -135,11 +139,76 @@ public final class OverlayStore: @unchecked Sendable {
     public func createDirectory(at path: RelativePath) throws {
         try lock.withLock {
             guard !path.isRoot else { return }
+            guard entry(at: path) == nil else { throw POSIXError(.EEXIST) }
             clearWhiteoutsThroughUnlocked(path)
             try fileManager.createDirectory(
                 at: path.url(relativeTo: upperRoot),
                 withIntermediateDirectories: true
             )
+        }
+    }
+
+    public func createFile(at path: RelativePath) throws -> URL {
+        try lock.withLock {
+            guard !path.isRoot else { throw GhosttreeError.invalidRelativePath(path.description) }
+            guard entry(at: path) == nil else { throw POSIXError(.EEXIST) }
+            try ensureUpperParentUnlocked(for: path)
+            clearWhiteoutsThroughUnlocked(path)
+            let destination = path.url(relativeTo: upperRoot)
+            guard fileManager.createFile(atPath: destination.path, contents: Data()) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            return destination
+        }
+    }
+
+    public func createSymbolicLink(at path: RelativePath, destination: String) throws -> URL {
+        try lock.withLock {
+            guard !path.isRoot else { throw GhosttreeError.invalidRelativePath(path.description) }
+            guard entry(at: path) == nil else { throw POSIXError(.EEXIST) }
+            try ensureUpperParentUnlocked(for: path)
+            clearWhiteoutsThroughUnlocked(path)
+            let url = path.url(relativeTo: upperRoot)
+            try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: destination)
+            return url
+        }
+    }
+
+    public func move(_ source: RelativePath, to destination: RelativePath) throws {
+        try lock.withLock {
+            guard !source.isRoot, !destination.isRoot else {
+                throw GhosttreeError.invalidRelativePath(source.isRoot ? source.description : destination.description)
+            }
+            guard entry(at: source) != nil else { throw GhosttreeError.missingItem(source.description) }
+            guard destination != source else { return }
+            guard !destination.components.starts(with: source.components) else { throw POSIXError(.EINVAL) }
+
+            if let destinationEntry = entry(at: destination) {
+                let sourceIsDirectory = try entry(at: source)!.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+                let destinationIsDirectory = try destinationEntry.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+                if sourceIsDirectory && !destinationIsDirectory { throw POSIXError(.ENOTDIR) }
+                if !sourceIsDirectory && destinationIsDirectory { throw POSIXError(.EISDIR) }
+                if destinationIsDirectory {
+                    let destinationContents = try contentsOfDirectory(at: destination)
+                    if !destinationContents.isEmpty { throw POSIXError(.ENOTEMPTY) }
+                }
+            }
+
+            let sourceLower = source.url(relativeTo: lowerRoot)
+            let sourceHadLower = fileManager.fileExists(atPath: sourceLower.path) && !isWhiteoutedUnlocked(source)
+            try materializeUnlocked(source)
+
+            let destinationUpper = destination.url(relativeTo: upperRoot)
+            try ensureUpperParentUnlocked(for: destination)
+            if fileManager.fileExists(atPath: destinationUpper.path) {
+                try fileManager.removeItem(at: destinationUpper)
+            }
+            clearWhiteoutsThroughUnlocked(destination)
+            try fileManager.moveItem(at: source.url(relativeTo: upperRoot), to: destinationUpper)
+
+            if sourceHadLower {
+                try createWhiteoutUnlocked(source)
+            }
         }
     }
 
@@ -151,6 +220,12 @@ public final class OverlayStore: @unchecked Sendable {
             let hadUpper = fileManager.fileExists(atPath: upper.path)
             let hadLower = fileManager.fileExists(atPath: lower.path) && !isWhiteoutedUnlocked(path)
             guard hadUpper || hadLower else { throw GhosttreeError.missingItem(path.description) }
+
+            if let visible = entry(at: path),
+               try visible.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true,
+               !((try? contentsOfDirectory(at: path)) ?? []).isEmpty {
+                throw POSIXError(.ENOTEMPTY)
+            }
 
             if hadUpper { try fileManager.removeItem(at: upper) }
             if hadLower { try createWhiteoutUnlocked(path) }
@@ -178,6 +253,24 @@ public final class OverlayStore: @unchecked Sendable {
         let parentURL = parent.url(relativeTo: upperRoot)
         if !fileManager.fileExists(atPath: parentURL.path) {
             try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: true)
+        }
+    }
+
+    private func materializeUnlocked(_ path: RelativePath) throws {
+        guard let visible = entry(at: path) else { throw GhosttreeError.missingItem(path.description) }
+        let isDirectory = try visible.url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+        if !isDirectory {
+            _ = try copyUp(path)
+            return
+        }
+
+        let upper = path.url(relativeTo: upperRoot)
+        if !fileManager.fileExists(atPath: upper.path) {
+            try ensureUpperParentUnlocked(for: path)
+            try fileManager.createDirectory(at: upper, withIntermediateDirectories: false)
+        }
+        for name in try contentsOfDirectory(at: path) {
+            try materializeUnlocked(path.appending(name))
         }
     }
 
